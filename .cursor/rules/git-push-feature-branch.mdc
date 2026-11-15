@@ -1,0 +1,22 @@
+---
+description: Push all git changes to a separate feature branch — never commit/push straight to main/master for deploy repos.
+alwaysApply: true
+---
+
+# Git push policy (Pictoriya)
+
+When the user asks to commit or push changes:
+
+1. **Never push directly to `main` or `master`** on `pictoria-client`, `pictoria-server`, or related deploy repos unless the user explicitly says to push to main.
+2. Create or use a **separate feature branch** with a clear name, for example:
+   - `feat/about-page`
+   - `fix/r2-cors`
+   - `chore/legal-pages`
+3. Workflow:
+   - `git status` / `git diff` / recent log
+   - `git checkout -b <branch>` (or checkout existing branch)
+   - stage + commit as `sjanupa <sjanupa.17@cse.mrt.ac.lk>`
+   - `git push -u origin <branch>`
+4. After push, tell the user the **branch name** and that they should open a PR into `main` (or merge when ready) so production stays stable.
+5. If both client and server change, push **each repo** on its own feature branch (do not push only the archive monorepo for deploys).
+6. Only push/merge to `main` when the user clearly requests it (e.g. "merge to main" / "push to main").
