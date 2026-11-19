@@ -21,6 +21,10 @@ import { isCatalogAdmin } from '../middleware/optionalAuth.middleware'
 import { User } from '../models/User.model'
 import { Book } from '../models/Book.model'
 
+function isDuplicateKeyError(err: unknown): boolean {
+  return typeof err === 'object' && err !== null && (err as { code?: number }).code === 11000
+}
+
 async function resolveViewer(req: Request) {
   const isAdmin = isCatalogAdmin(req)
   let isPremium = false
@@ -113,6 +117,13 @@ export const createChapter = async (req: Request, res: Response): Promise<Respon
 
     return successResponse(res, chapter, 201, 'Chapter created')
   } catch (err) {
+    if (isDuplicateKeyError(err)) {
+      return errorResponse(
+        res,
+        `Chapter ${parsed.data.chapterNumber} already exists for this book`,
+        409,
+      )
+    }
     const message = err instanceof Error ? err.message : 'Failed to create chapter pages'
     return errorResponse(res, message, 400)
   }
@@ -138,6 +149,9 @@ export const updateChapter = async (req: Request, res: Response): Promise<Respon
     }
     return successResponse(res, updated, 200, 'Chapter updated')
   } catch (err) {
+    if (isDuplicateKeyError(err)) {
+      return errorResponse(res, 'Another chapter in this book already uses that number', 409)
+    }
     const message = err instanceof Error ? err.message : 'Failed to update chapter pages'
     return errorResponse(res, message, 400)
   }
