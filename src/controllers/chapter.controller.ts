@@ -1,7 +1,11 @@
 import { Request, Response } from 'express'
 import { Types } from 'mongoose'
 import { successResponse, errorResponse } from '../utils/apiResponse'
-import { createChapterSchema, updateChapterSchema } from '../validators/chapter.validator'
+import {
+  createChapterSchema,
+  updateChapterSchema,
+  uploadPagesSchema,
+} from '../validators/chapter.validator'
 import { paramString } from '../utils/paramString'
 import {
   createChapterRecord,
@@ -10,6 +14,7 @@ import {
   findChapterDocumentById,
   findChaptersByBookId,
   updateChapterRecord,
+  uploadPagesForBook,
 } from '../services/chapter.service'
 import { findChapterForReading } from '../services/book.service'
 import { isCatalogAdmin } from '../middleware/optionalAuth.middleware'
@@ -136,6 +141,24 @@ export const updateChapter = async (req: Request, res: Response): Promise<Respon
     const message = err instanceof Error ? err.message : 'Failed to update chapter pages'
     return errorResponse(res, message, 400)
   }
+}
+
+export const uploadPages = async (req: Request, res: Response): Promise<Response> => {
+  const parsed = uploadPagesSchema.safeParse(req.body)
+  if (!parsed.success) {
+    return errorResponse(res, 'Validation failed', 400, parsed.error.issues.map((i) => i.message))
+  }
+
+  const files = (req.files as Express.Multer.File[]) ?? []
+  if (files.length === 0) {
+    return errorResponse(res, 'No pages uploaded', 400)
+  }
+
+  const pages = await uploadPagesForBook(parsed.data.bookId, parsed.data.chapterNumber, files)
+  if (!pages) {
+    return errorResponse(res, 'Book not found', 404)
+  }
+  return successResponse(res, pages, 201, 'Pages uploaded')
 }
 
 export const deleteChapter = async (req: Request, res: Response): Promise<Response> => {

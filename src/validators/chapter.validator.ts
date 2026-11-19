@@ -11,7 +11,18 @@ export const pageManifestEntrySchema = z.discriminatedUnion('type', [
     fileIndex: z.number().int().min(0),
     displayName: z.string().min(1).optional(),
   }),
+  /** Page already stored via POST /chapters/pages/upload (batched large-book uploads). */
+  z.object({
+    type: z.literal('uploaded'),
+    url: z.string().min(1),
+    displayName: z.string().min(1).optional(),
+  }),
 ])
+
+export const uploadPagesSchema = z.object({
+  bookId: z.string().min(1),
+  chapterNumber: z.coerce.number().int().positive(),
+})
 
 export const pageManifestSchema = z.array(pageManifestEntrySchema)
 

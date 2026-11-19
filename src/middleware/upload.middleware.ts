@@ -19,3 +19,7 @@ const upload = multer({
 
 export const uploadSingle = upload.single('image')
 export const uploadMultiple = upload.array('pages', 150)
+
+/** Batched page uploads: keep each request well under proxy body/time limits. */
+export const PAGE_BATCH_MAX_FILES = 20
+export const uploadPageBatch = upload.array('pages', PAGE_BATCH_MAX_FILES)

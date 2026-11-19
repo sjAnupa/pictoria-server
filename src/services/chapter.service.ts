@@ -1,8 +1,12 @@
+import { randomBytes } from 'crypto'
 import { Types } from 'mongoose'
 import { Chapter, IChapter } from '../models/Chapter.model'
-import { Book, IBook } from '../models/Book.model'
-import { rewriteLegacyMediaPath } from '../config/mediaPaths'
+import { Book } from '../models/Book.model'
+import { PAGES_ROOT, rewriteLegacyMediaPath } from '../config/mediaPaths'
 import { deleteStoredImage, uploadChapterPage } from './storage.service'
+import { isR2MediaUrl } from './r2.service'
+import { invalidateAdminDashboardCache } from './dashboardCache'
+import { mapWithConcurrency } from '../utils/mapWithConcurrency'
 import {
   CreateChapterInput,
   PageManifestEntry,
@@ -10,9 +14,35 @@ import {
   parsePageManifest,
 } from '../validators/chapter.validator'
 
-function padPageIndex(index: number): string {
-  return String(index).padStart(3, '0')
+/** Parallel sharp + R2 uploads per request; bounded to keep memory/CPU sane. */
+const PAGE_UPLOAD_CONCURRENCY = 4
+
+/**
+ * Every stored page gets a unique key. Media is served with an immutable
+ * cache header, so a key must never be reused for different image bytes.
+ */
+function uniquePageFilename(position: number): string {
+  const order = String(position).padStart(3, '0')
+  return `page-${order}-${Date.now().toString(36)}${randomBytes(3).toString('hex')}`
 }
+
+function bookPagesMarker(bookSlug: string): string {
+  return `/${PAGES_ROOT}/books/${bookSlug}/chapters/`
+}
+
+/** Pre-uploaded page URLs must point into this book's own pages folder. */
+function isOwnedPageUrl(url: string, bookSlug: string): boolean {
+  if (url.includes('..')) return false
+  const hostedByUs = isR2MediaUrl(url) || url.startsWith('/uploads/')
+  return hostedByUs && url.includes(bookPagesMarker(bookSlug))
+}
+
+function deleteInBackground(urls: string[]): void {
+  if (urls.length === 0) return
+  void mapWithConcurrency(urls, 8, (url) => deleteStoredImage(url).catch(() => undefined))
+}
+
+type StoredPage = { url: string; name: string }
 
 function basenameFromUrl(url: string): string {
   const segment = url.split('/').pop()?.split('?')[0]
@@ -62,24 +92,81 @@ export async function findChapterById(id: string) {
   }
 }
 
+/** Upload files in parallel (bounded), keeping their order. */
 export async function uploadChapterPages(
   files: Express.Multer.File[],
   bookSlug: string,
   chapterNumber: number,
+  startPosition = 1,
 ): Promise<string[]> {
-  const urls: string[] = []
+  return mapWithConcurrency(files, PAGE_UPLOAD_CONCURRENCY, (file, i) =>
+    uploadChapterPage(file, bookSlug, chapterNumber, uniquePageFilename(startPosition + i)),
+  )
+}
 
-  for (let i = 0; i < files.length; i += 1) {
-    const url = await uploadChapterPage(
-      files[i],
-      bookSlug,
-      chapterNumber,
-      `page-${padPageIndex(i + 1)}`,
-    )
-    urls.push(url)
-  }
+/**
+ * Batched page upload for large books: stores pages and returns their URLs,
+ * which the client then references from the chapter manifest as `uploaded`.
+ */
+export async function uploadPagesForBook(
+  bookId: string,
+  chapterNumber: number,
+  files: Express.Multer.File[],
+): Promise<Array<{ url: string; displayName: string }> | null> {
+  if (!Types.ObjectId.isValid(bookId)) return null
+  const book = await Book.findById(bookId).select('slug').lean()
+  if (!book) return null
 
-  return urls
+  const urls = await uploadChapterPages(files, book.slug, chapterNumber)
+  return urls.map((url, i) => ({
+    url,
+    displayName: files[i]?.originalname || basenameFromUrl(url),
+  }))
+}
+
+/**
+ * Resolve a manifest into stored pages. New files are uploaded in parallel;
+ * existing/uploaded entries are validated. Nothing is deleted here.
+ */
+async function resolveManifestPages(
+  manifest: PageManifestEntry[],
+  files: Express.Multer.File[],
+  bookSlug: string,
+  chapterNumber: number,
+  chapter?: IChapter,
+): Promise<StoredPage[]> {
+  const previousUrls = chapter ? [...chapter.pageImageUrls] : []
+
+  return mapWithConcurrency(manifest, PAGE_UPLOAD_CONCURRENCY, async (entry, i): Promise<StoredPage> => {
+    if (entry.type === 'existing') {
+      if (!chapter) {
+        throw new Error('Invalid page manifest: new chapters cannot reference existing pages')
+      }
+      const matched = resolveExistingPageUrl(previousUrls, entry.url)
+      if (!matched) {
+        throw new Error('Invalid page manifest: unknown existing page')
+      }
+      return {
+        url: matched,
+        name: resolveDisplayName(entry.displayName, previousDisplayName(chapter, previousUrls, matched)),
+      }
+    }
+
+    if (entry.type === 'uploaded') {
+      const url = entry.url.trim()
+      if (!isOwnedPageUrl(url, bookSlug)) {
+        throw new Error('Invalid page manifest: uploaded page does not belong to this book')
+      }
+      return { url, name: resolveDisplayName(entry.displayName, basenameFromUrl(url)) }
+    }
+
+    const file = files[entry.fileIndex]
+    if (!file) {
+      throw new Error('Invalid page manifest: missing upload file')
+    }
+    const url = await uploadChapterPage(file, bookSlug, chapterNumber, uniquePageFilename(i + 1))
+    return { url, name: resolveDisplayName(entry.displayName, file.originalname || basenameFromUrl(url)) }
+  })
 }
 
 export async function createChapterRecord(
@@ -94,28 +181,9 @@ export async function createChapterRecord(
 
   const manifest = parsePageManifest(input.pageManifest)
   if (manifest && manifest.length > 0) {
-    for (let i = 0; i < manifest.length; i += 1) {
-      const entry = manifest[i]
-      if (entry.type !== 'new') {
-        throw new Error('Invalid page manifest: new chapters only accept new uploads')
-      }
-
-      const file = files[entry.fileIndex]
-      if (!file) {
-        throw new Error('Invalid page manifest: missing upload file')
-      }
-
-      const url = await uploadChapterPage(
-        file,
-        book.slug,
-        input.chapterNumber,
-        `page-${padPageIndex(i + 1)}`,
-      )
-      pageImageUrls.push(url)
-      pageImageNames.push(
-        resolveDisplayName(entry.displayName, file.originalname || basenameFromUrl(url)),
-      )
-    }
+    const pages = await resolveManifestPages(manifest, files, book.slug, input.chapterNumber)
+    pageImageUrls = pages.map((p) => p.url)
+    pageImageNames = pages.map((p) => p.name)
   } else if (files.length) {
     pageImageUrls = await uploadChapterPages(files, book.slug, input.chapterNumber)
     pageImageNames = files.map(
@@ -136,8 +204,8 @@ export async function createChapterRecord(
     highlightUntil,
   })
 
-  book.totalChapters += 1
-  await book.save()
+  await Book.updateOne({ _id: book._id }, { $inc: { totalChapters: 1 } })
+  invalidateAdminDashboardCache()
 
   return chapter
 }
@@ -151,104 +219,53 @@ function resolveExistingPageUrl(previousUrls: string[], requested: string): stri
   return previousUrls.find((url) => canonicalStoredUrl(url) === canon)
 }
 
-async function applyPageManifest(
-  chapter: IChapter,
-  bookSlug: string,
-  manifest: PageManifestEntry[],
-  files: Express.Multer.File[],
-): Promise<void> {
-  const previousUrls = [...chapter.pageImageUrls]
-  const nextUrls: string[] = []
-  const nextNames: string[] = []
-
-  for (let i = 0; i < manifest.length; i += 1) {
-    const entry = manifest[i]
-    if (entry.type === 'existing') {
-      const matched = resolveExistingPageUrl(previousUrls, entry.url)
-      if (!matched) {
-        throw new Error('Invalid page manifest: unknown existing page')
-      }
-      nextUrls.push(matched)
-      nextNames.push(
-        resolveDisplayName(
-          entry.displayName,
-          previousDisplayName(chapter, previousUrls, matched),
-        ),
-      )
-      continue
-    }
-
-    const file = files[entry.fileIndex]
-    if (!file) {
-      throw new Error('Invalid page manifest: missing upload file')
-    }
-
-    const url = await uploadChapterPage(
-      file,
-      bookSlug,
-      chapter.chapterNumber,
-      `page-${padPageIndex(i + 1)}`,
-    )
-    nextUrls.push(url)
-    nextNames.push(
-      resolveDisplayName(entry.displayName, file.originalname || basenameFromUrl(url)),
-    )
-  }
-
-  for (const url of previousUrls) {
-    if (!nextUrls.includes(url)) {
-      await deleteStoredImage(url)
-    }
-  }
-
-  chapter.pageImageUrls = nextUrls
-  chapter.pageImageNames = nextNames
-  chapter.totalPages = nextUrls.length
-}
-
 export async function updateChapterRecord(
   chapter: IChapter,
   input: UpdateChapterInput,
   files?: Express.Multer.File[],
 ) {
-  const book = await Book.findById(chapter.bookId)
-  if (!book) return null
-
   if (input.title !== undefined) chapter.title = input.title
   if (input.chapterNumber !== undefined) chapter.chapterNumber = input.chapterNumber
   if (input.highlightUntil !== undefined) chapter.highlightUntil = input.highlightUntil
 
   const manifest = parsePageManifest(input.pageManifest)
-  if (manifest) {
-    await applyPageManifest(chapter, book.slug, manifest, files ?? [])
-  } else if (files && files.length > 0) {
-    for (const url of chapter.pageImageUrls) {
-      await deleteStoredImage(url)
-    }
-    chapter.pageImageUrls = await uploadChapterPages(files, book.slug, chapter.chapterNumber)
-    chapter.pageImageNames = files.map(
-      (file, index) => file.originalname || basenameFromUrl(chapter.pageImageUrls[index] ?? ''),
-    )
-    chapter.totalPages = chapter.pageImageUrls.length
+  const replacesPages = Boolean(manifest) || Boolean(files && files.length > 0)
+  const previousUrls = [...chapter.pageImageUrls]
+
+  if (replacesPages) {
+    const book = await Book.findById(chapter.bookId).select('slug').lean()
+    if (!book) return null
+
+    const pages = manifest
+      ? await resolveManifestPages(manifest, files ?? [], book.slug, chapter.chapterNumber, chapter)
+      : (await uploadChapterPages(files!, book.slug, chapter.chapterNumber)).map((url, i) => ({
+          url,
+          name: files![i]?.originalname || basenameFromUrl(url),
+        }))
+
+    chapter.pageImageUrls = pages.map((p) => p.url)
+    chapter.pageImageNames = pages.map((p) => p.name)
+    chapter.totalPages = pages.length
   }
 
   await chapter.save()
+
+  if (replacesPages) {
+    const kept = new Set(chapter.pageImageUrls)
+    deleteInBackground(previousUrls.filter((url) => !kept.has(url)))
+  }
   return chapter
 }
 
 export async function deleteChapterRecord(chapter: IChapter) {
-  const book = await Book.findById(chapter.bookId)
-
-  for (const url of chapter.pageImageUrls) {
-    await deleteStoredImage(url)
-  }
-
+  const urls = [...chapter.pageImageUrls]
   await chapter.deleteOne()
-
-  if (book && book.totalChapters > 0) {
-    book.totalChapters -= 1
-    await book.save()
-  }
+  await Book.updateOne(
+    { _id: chapter.bookId, totalChapters: { $gt: 0 } },
+    { $inc: { totalChapters: -1 } },
+  )
+  invalidateAdminDashboardCache()
+  deleteInBackground(urls)
 }
 
 export async function findChapterDocumentById(id: string) {
