@@ -3,6 +3,8 @@ import express from 'express'
 import helmet from 'helmet'
 import cors from 'cors'
 import morgan from 'morgan'
+import mongoose from 'mongoose'
+import { timingMiddleware } from './middleware/timing.middleware'
 import { CLIENT_URL, NODE_ENV } from './config/env'
 import { UPLOADS_ROOT } from './config/storage'
 import authRoutes from './routes/auth.routes'
@@ -18,6 +20,10 @@ import adminRoutes from './routes/admin.routes'
 import { errorMiddleware } from './middleware/error.middleware'
 
 const app = express()
+
+// Cloudflare (and any host proxy) sits in front; needed for req.ip / rate limits.
+app.set('trust proxy', Number(process.env.TRUST_PROXY_HOPS ?? 1))
+app.use(timingMiddleware)
 
 app.use(
   helmet({
@@ -69,6 +75,24 @@ app.use('/uploads', express.static(UPLOADS_ROOT))
 
 app.get('/api/health', (_req, res) => {
   res.status(200).json({ status: 'ok', timestamp: new Date() })
+})
+
+/** Round trip to MongoDB (Atlas) — tells DB latency apart from network latency. */
+app.get('/api/health/db', async (_req, res) => {
+  const db = mongoose.connection.db
+  if (!db || mongoose.connection.readyState !== 1) {
+    res.status(503).json({ status: 'down', readyState: mongoose.connection.readyState })
+    return
+  }
+  const start = process.hrtime.bigint()
+  try {
+    await db.admin().ping()
+    const pingMs = Number(process.hrtime.bigint() - start) / 1e6
+    res.setHeader('Cache-Control', 'no-store')
+    res.status(200).json({ status: 'ok', pingMs: Math.round(pingMs) })
+  } catch {
+    res.status(503).json({ status: 'error' })
+  }
 })
 
 app.use('/api/auth', authRoutes)

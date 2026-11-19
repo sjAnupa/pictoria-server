@@ -3,10 +3,20 @@ import * as chapterController from '../controllers/chapter.controller'
 import { authMiddleware } from '../middleware/auth.middleware'
 import { optionalAuthMiddleware } from '../middleware/optionalAuth.middleware'
 import { requireRole } from '../middleware/role.middleware'
-import { uploadMultiple } from '../middleware/upload.middleware'
+import { uploadMultiple, uploadPageBatch } from '../middleware/upload.middleware'
+import { pageBatchRateLimiter } from '../middleware/pageBatchRateLimit.middleware'
 import { uploadRateLimiter } from '../middleware/rateLimit.middleware'
 
 const router = Router()
+
+router.post(
+  '/pages/upload',
+  authMiddleware,
+  requireRole('admin'),
+  pageBatchRateLimiter,
+  uploadPageBatch,
+  chapterController.uploadPages,
+)
 
 router.get(
   '/book/:bookId/chapter/:chapterNumber',

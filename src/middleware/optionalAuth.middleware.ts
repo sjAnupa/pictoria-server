@@ -1,7 +1,7 @@
 import { Request, Response, NextFunction } from 'express'
 import jwt from 'jsonwebtoken'
 import { JWT_SECRET } from '../config/env'
-import { User } from '../models/User.model'
+import { loadAuthUser } from './auth.middleware'
 
 interface JwtPayload {
   _id: string
@@ -23,16 +23,14 @@ export const optionalAuthMiddleware = async (
 
   try {
     const decoded = jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'] }) as JwtPayload
-    const user = await User.findById(decoded._id).select(
-      'role is_admin is_super_admin isActive',
-    )
+    const user = await loadAuthUser(String(decoded._id))
 
     if (user?.isActive) {
       req.user = {
-        _id: String(user._id),
+        _id: String(decoded._id),
         role: user.role,
-        is_admin: Boolean(user.is_admin),
-        is_super_admin: Boolean(user.is_super_admin),
+        is_admin: user.is_admin,
+        is_super_admin: user.is_super_admin,
       }
     }
   } catch {

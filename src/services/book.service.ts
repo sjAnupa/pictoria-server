@@ -8,6 +8,8 @@ import { SavedBook } from '../models/SavedBook.model'
 import { normalizeMediaUrl, normalizeMediaUrls } from '../config/storage'
 import { generateSlug } from '../utils/generateSlug'
 import { deleteStoredImage, uploadCoverImage } from './storage.service'
+import { invalidateAdminDashboardCache } from './dashboardCache'
+import { mapWithConcurrency } from '../utils/mapWithConcurrency'
 import { CreateBookInput, UpdateBookInput, parseStringArray } from '../validators/book.validator'
 import {
   evaluateChapterAccess,
@@ -219,6 +221,7 @@ export async function createBookRecord(
     uploadedBy,
   })
 
+  invalidateAdminDashboardCache()
   return book
 }
 
@@ -227,6 +230,7 @@ export async function updateBookRecord(
   input: UpdateBookInput,
   coverFile?: Express.Multer.File,
 ) {
+  const titleChanged = input.title !== undefined && input.title !== book.title
   if (input.title !== undefined) book.title = input.title
   if (input.author !== undefined) book.author = input.author
   if (input.publisher !== undefined) book.publisher = input.publisher.trim()
@@ -244,29 +248,32 @@ export async function updateBookRecord(
   if (input.newArrival !== undefined) book.newArrival = input.newArrival
   if (input.reviewsEnabled !== undefined) book.reviewsEnabled = input.reviewsEnabled
 
-  if (input.title) {
+  if (titleChanged && input.title) {
     book.slug = await ensureUniqueSlug(input.title, String(book._id))
   }
 
+  let replacedCoverUrl: string | undefined
   if (coverFile) {
-    await deleteStoredImage(book.coverImageUrl)
+    replacedCoverUrl = book.coverImageUrl
     book.coverImageUrl = await uploadCoverImage(coverFile, book.slug)
   }
 
   await book.save()
+  invalidateAdminDashboardCache()
+
+  if (replacedCoverUrl && replacedCoverUrl !== book.coverImageUrl) {
+    void deleteStoredImage(replacedCoverUrl).catch(() => undefined)
+  }
   return book
 }
 
 export async function deleteBookRecord(book: IBook) {
-  const chapters = await Chapter.find({ bookId: book._id })
+  const chapters = await Chapter.find({ bookId: book._id }).select('pageImageUrls').lean()
 
-  await deleteStoredImage(book.coverImageUrl)
-  for (const chapter of chapters) {
-    for (const url of chapter.pageImageUrls) {
-      await deleteStoredImage(url)
-    }
-  }
+  const mediaUrls = [book.coverImageUrl, ...chapters.flatMap((c) => c.pageImageUrls ?? [])].filter(Boolean)
+  await mapWithConcurrency(mediaUrls, 8, (url) => deleteStoredImage(url).catch(() => undefined))
 
+  invalidateAdminDashboardCache()
   await Promise.all([
     Chapter.deleteMany({ bookId: book._id }),
     ReadingProgress.deleteMany({ bookId: book._id }),

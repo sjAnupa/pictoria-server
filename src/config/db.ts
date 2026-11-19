@@ -5,7 +5,9 @@ import { MONGODB_URI } from './env'
 const MONGO_OPTIONS = {
   serverSelectionTimeoutMS: 15_000,
   socketTimeoutMS: 45_000,
-  maxPoolSize: 10,
+  maxPoolSize: 20,
+  // Warm sockets avoid a fresh TLS handshake per burst to a remote Atlas region.
+  minPoolSize: 3,
 } as const
 
 const STARTUP_RETRIES = 5

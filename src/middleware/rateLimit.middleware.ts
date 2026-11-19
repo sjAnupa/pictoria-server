@@ -1,4 +1,16 @@
-import rateLimit from 'express-rate-limit'
+import type { Request } from 'express'
+import { rateLimit as createRateLimit, ipKeyGenerator, type Options } from 'express-rate-limit'
+
+/** Behind Cloudflare every request shares the proxy IP; key on the real visitor. */
+function clientKey(req: Request): string {
+  const cfIp = req.headers['cf-connecting-ip']
+  const ip = (Array.isArray(cfIp) ? cfIp[0] : cfIp) || req.ip || 'unknown'
+  return ipKeyGenerator(ip)
+}
+
+function rateLimit(options: Partial<Options>) {
+  return createRateLimit({ keyGenerator: clientKey, ...options })
+}
 
 /** Login / OAuth — blunt credential stuffing and token spam. */
 export const authRateLimiter = rateLimit({
