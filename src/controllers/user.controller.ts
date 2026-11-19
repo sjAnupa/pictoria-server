@@ -3,6 +3,7 @@ import { Types } from 'mongoose'
 import { User, IUser, sanitizeUser } from '../models/User.model'
 import { successResponse, errorResponse } from '../utils/apiResponse'
 import { paramString } from '../utils/paramString'
+import { invalidateAuthUser } from '../middleware/auth.middleware'
 
 export const getAllUsers = async (req: Request, res: Response): Promise<Response> => {
   const page = Math.max(1, Number(req.query.page) || 1)
@@ -97,6 +98,7 @@ export const updateUser = async (req: Request, res: Response): Promise<Response>
   }
 
   await user.save()
+  invalidateAuthUser(String(user._id))
 
   const safe = await User.findById(user._id).select('-passwordHash')
   return successResponse(res, sanitizeUser(safe!))
@@ -118,5 +120,6 @@ export const deleteUser = async (req: Request, res: Response): Promise<Response>
   }
 
   await user.deleteOne()
+  invalidateAuthUser(String(user._id))
   return successResponse(res, { message: 'User deleted' })
 }
