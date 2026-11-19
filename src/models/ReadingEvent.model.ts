@@ -31,6 +31,7 @@ const ReadingEventSchema = new Schema<IReadingEvent>(
   { timestamps: { createdAt: true, updatedAt: false } },
 )
 
+ReadingEventSchema.index({ createdAt: -1 })
 ReadingEventSchema.index({ userId: 1, createdAt: -1 })
 ReadingEventSchema.index({ userId: 1, bookId: 1, createdAt: -1 })
 ReadingEventSchema.index({ bookId: 1, action: 1, createdAt: -1 })

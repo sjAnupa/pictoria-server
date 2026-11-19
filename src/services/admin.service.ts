@@ -3,6 +3,9 @@ import { Book } from '../models/Book.model'
 import { User } from '../models/User.model'
 import { ReadingEvent } from '../models/ReadingEvent.model'
 import { ReadingProgress } from '../models/ReadingProgress.model'
+import { invalidateAdminDashboardCache, withDashboardCache } from './dashboardCache'
+
+export { invalidateAdminDashboardCache }
 
 const GENRE_CHART_COLORS = [
   '#7C3AED',
@@ -78,7 +81,19 @@ function formatChartDate(d: Date): string {
   return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
 }
 
-export async function getAdminDashboardStats(): Promise<AdminDashboardStats> {
+type BookFacetRow = {
+  totals: Array<{ books: number; totalReads: number; totalViews: number }>
+  genres: Array<{ _id: string; count: number }>
+  mostRead: Array<{ title: string; reads: number }>
+  mostLiked: Array<{ title: string; likes: number }>
+}
+
+/** Cached for 60s; concurrent callers share one computation. */
+export function getAdminDashboardStats(options: { fresh?: boolean } = {}): Promise<AdminDashboardStats> {
+  return withDashboardCache(options, computeAdminDashboardStats)
+}
+
+async function computeAdminDashboardStats(): Promise<AdminDashboardStats> {
   const startOfToday = new Date()
   startOfToday.setHours(0, 0, 0, 0)
 
@@ -86,22 +101,8 @@ export async function getAdminDashboardStats(): Promise<AdminDashboardStats> {
   fourteenDaysAgo.setDate(fourteenDaysAgo.getDate() - 13)
   fourteenDaysAgo.setHours(0, 0, 0, 0)
 
-  const [
-    books,
-    users,
-    readsAgg,
-    viewsAgg,
-    activeToday,
-    dailyAgg,
-    genreAgg,
-    mostReadBooksRaw,
-    mostLikedBooksRaw,
-    topReadersAgg,
-  ] = await Promise.all([
-    Book.countDocuments(),
+  const [users, activeToday, dailyAgg, bookFacet, topReadersAgg] = await Promise.all([
     User.countDocuments(READER_FILTER),
-    Book.aggregate<{ total: number }>([{ $group: { _id: null, total: { $sum: '$stats.totalReads' } } }]),
-    Book.aggregate<{ total: number }>([{ $group: { _id: null, total: { $sum: '$stats.totalViews' } } }]),
     ReadingEvent.distinct('userId', { createdAt: { $gte: startOfToday } }),
     ReadingEvent.aggregate<{ _id: string; reads: number }>([
       { $match: { createdAt: { $gte: fourteenDaysAgo } } },
@@ -113,51 +114,58 @@ export async function getAdminDashboardStats(): Promise<AdminDashboardStats> {
       },
       { $sort: { _id: 1 } },
     ]),
-    Book.aggregate<{ _id: string; count: number }>([
-      { $unwind: '$genres' },
-      { $group: { _id: '$genres', count: { $sum: 1 } } },
-      { $sort: { count: -1 } },
-      { $limit: 8 },
+    Book.aggregate<BookFacetRow>([
+      { $project: { title: 1, genres: 1, stats: 1 } },
+      {
+        $facet: {
+          totals: [
+            {
+              $group: {
+                _id: null,
+                books: { $sum: 1 },
+                totalReads: { $sum: { $ifNull: ['$stats.totalReads', 0] } },
+                totalViews: { $sum: { $ifNull: ['$stats.totalViews', 0] } },
+              },
+            },
+          ],
+          genres: [
+            { $unwind: '$genres' },
+            { $group: { _id: '$genres', count: { $sum: 1 } } },
+            { $sort: { count: -1 } },
+            { $limit: 8 },
+          ],
+          mostRead: [
+            { $sort: { 'stats.totalReads': -1 } },
+            { $limit: 6 },
+            { $project: { _id: 0, title: 1, reads: { $ifNull: ['$stats.totalReads', 0] } } },
+          ],
+          mostLiked: [
+            { $match: { 'stats.totalLikes': { $gt: 0 } } },
+            { $sort: { 'stats.totalLikes': -1 } },
+            { $limit: 6 },
+            { $project: { _id: 0, title: 1, likes: '$stats.totalLikes' } },
+          ],
+        },
+      },
     ]),
-    Book.find()
-      .sort({ 'stats.totalReads': -1 })
-      .limit(6)
-      .select('title stats.totalReads')
-      .lean(),
-    Book.find()
-      .sort({ 'stats.totalLikes': -1 })
-      .limit(6)
-      .select('title stats.totalLikes')
-      .lean(),
-    ReadingProgress.aggregate<{ _id: Types.ObjectId; books: number; lastReadAt: Date; name: string }>([
-      {
-        $lookup: {
-          from: 'users',
-          localField: 'userId',
-          foreignField: '_id',
-          as: 'user',
-        },
-      },
-      { $unwind: '$user' },
-      {
-        $match: {
-          'user.is_admin': false,
-          'user.is_super_admin': false,
-          'user.isActive': { $ne: false },
-        },
-      },
+    // Group first (index-friendly, no join), then the small candidate list is
+    // filtered against users below; extra rows absorb admins/inactive users.
+    ReadingProgress.aggregate<{ _id: Types.ObjectId; books: number; lastReadAt: Date }>([
       {
         $group: {
           _id: '$userId',
           books: { $sum: 1 },
           lastReadAt: { $max: '$lastReadAt' },
-          name: { $first: '$user.name' },
         },
       },
       { $sort: { books: -1, lastReadAt: -1 } },
-      { $limit: 5 },
+      { $limit: 25 },
     ]),
   ])
+
+  const facet = bookFacet[0]
+  const bookTotals = facet?.totals[0]
+  const genreAgg = facet?.genres ?? []
 
   const dailyMap = new Map(dailyAgg.map((d) => [d._id, d.reads]))
   const dailyReads: Array<{ date: string; reads: number }> = []
@@ -175,17 +183,8 @@ export async function getAdminDashboardStats(): Promise<AdminDashboardStats> {
     color: GENRE_CHART_COLORS[i % GENRE_CHART_COLORS.length],
   }))
 
-  const mostReadBooks = mostReadBooksRaw.map((b) => ({
-    title: b.title,
-    reads: b.stats?.totalReads ?? 0,
-  }))
-
-  const mostLikedBooks = mostLikedBooksRaw
-    .filter((b) => (b.stats?.totalLikes ?? 0) > 0)
-    .map((b) => ({
-      title: b.title,
-      likes: b.stats?.totalLikes ?? 0,
-    }))
+  const mostReadBooks = facet?.mostRead ?? []
+  const mostLikedBooks = facet?.mostLiked ?? []
 
   const readerIds = topReadersAgg.map((r) => r._id)
   const readerUsers = await User.find({
@@ -214,14 +213,15 @@ export async function getAdminDashboardStats(): Promise<AdminDashboardStats> {
         user.isActive !== false && row.lastReadAt >= thirtyDaysAgo ? 'Active' : 'Inactive'
       return { name, initials, books: row.books, status: active as 'Active' | 'Inactive' }
     })
+    .slice(0, 5)
 
   return {
     totals: {
-      books,
+      books: bookTotals?.books ?? 0,
       users,
-      totalReads: readsAgg[0]?.total ?? 0,
+      totalReads: bookTotals?.totalReads ?? 0,
       activeToday: activeToday.length,
-      totalViews: viewsAgg[0]?.total ?? 0,
+      totalViews: bookTotals?.totalViews ?? 0,
     },
     dailyReads,
     genreDistribution,
