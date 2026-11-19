@@ -6,8 +6,8 @@ import {
   getBookEngagement,
   getLikedBooks,
   getSavedBooks,
-  toggleBookLike,
-  toggleSavedBook,
+  setBookLike,
+  setSavedBook,
 } from '../services/engagement.service'
 
 function parseBookId(res: Response, raw: string): string | null {
@@ -16,6 +16,12 @@ function parseBookId(res: Response, raw: string): string | null {
     return null
   }
   return raw
+}
+
+/** Explicit desired state (idempotent); absent means legacy toggle. */
+function desiredFlag(body: unknown, key: 'liked' | 'saved'): boolean | undefined {
+  const value = (body as Record<string, unknown> | undefined)?.[key]
+  return typeof value === 'boolean' ? value : undefined
 }
 
 export const getEngagement = async (req: Request, res: Response): Promise<Response> => {
@@ -31,7 +37,7 @@ export const toggleLike = async (req: Request, res: Response): Promise<Response>
   if (!bookId) return res
 
   try {
-    const state = await toggleBookLike(String(req.user!._id), bookId)
+    const state = await setBookLike(String(req.user!._id), bookId, desiredFlag(req.body, 'liked'))
     return successResponse(res, state, 200, 'Like updated')
   } catch (err) {
     if (err instanceof Error && err.message === 'BOOK_NOT_FOUND') {
@@ -46,7 +52,7 @@ export const toggleSave = async (req: Request, res: Response): Promise<Response>
   if (!bookId) return res
 
   try {
-    const state = await toggleSavedBook(String(req.user!._id), bookId)
+    const state = await setSavedBook(String(req.user!._id), bookId, desiredFlag(req.body, 'saved'))
     return successResponse(res, state, 200, 'Save updated')
   } catch (err) {
     if (err instanceof Error && err.message === 'BOOK_NOT_FOUND') {

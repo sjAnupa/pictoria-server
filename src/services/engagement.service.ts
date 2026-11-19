@@ -22,11 +22,6 @@ export type ShelfBookItem = {
   likedAt?: string
 }
 
-async function assertBookExists(bookId: string): Promise<void> {
-  const exists = await Book.exists({ _id: bookId })
-  if (!exists) throw new Error('BOOK_NOT_FOUND')
-}
-
 export async function getBookEngagement(
   userId: string,
   bookId: string,
@@ -42,36 +37,77 @@ export async function getBookEngagement(
   return { liked: Boolean(liked), saved: Boolean(saved) }
 }
 
-export async function toggleBookLike(userId: string, bookId: string): Promise<BookEngagementState> {
-  await assertBookExists(bookId)
+/**
+ * Set (or toggle when `desired` is omitted) a like. At most two sequential
+ * round trips: the idempotent write, then the counter bump only if it changed.
+ */
+export async function setBookLike(
+  userId: string,
+  bookId: string,
+  desired?: boolean,
+): Promise<BookEngagementState> {
   const uid = new Types.ObjectId(userId)
   const bid = new Types.ObjectId(bookId)
+  const savedPromise = SavedBook.exists({ userId: uid, bookId: bid })
 
-  const existing = await BookLike.findOne({ userId: uid, bookId: bid })
-  if (existing) {
-    await existing.deleteOne()
-    await Book.updateOne({ _id: bid, 'stats.totalLikes': { $gt: 0 } }, { $inc: { 'stats.totalLikes': -1 } })
+  const target = desired ?? !(await BookLike.exists({ userId: uid, bookId: bid }))
+
+  if (target) {
+    const result = await BookLike.updateOne(
+      { userId: uid, bookId: bid },
+      { $setOnInsert: { likedAt: new Date() } },
+      { upsert: true },
+    )
+    if (result.upsertedCount > 0) {
+      const bump = await Book.updateOne({ _id: bid }, { $inc: { 'stats.totalLikes': 1 } })
+      if (bump.matchedCount === 0) {
+        await BookLike.deleteOne({ userId: uid, bookId: bid })
+        throw new Error('BOOK_NOT_FOUND')
+      }
+    }
   } else {
-    await BookLike.create({ userId: uid, bookId: bid })
-    await Book.updateOne({ _id: bid }, { $inc: { 'stats.totalLikes': 1 } })
+    const result = await BookLike.deleteOne({ userId: uid, bookId: bid })
+    if (result.deletedCount > 0) {
+      await Book.updateOne(
+        { _id: bid, 'stats.totalLikes': { $gt: 0 } },
+        { $inc: { 'stats.totalLikes': -1 } },
+      )
+    }
   }
 
-  return getBookEngagement(userId, bookId)
+  return { liked: target, saved: Boolean(await savedPromise) }
 }
 
-export async function toggleSavedBook(userId: string, bookId: string): Promise<BookEngagementState> {
-  await assertBookExists(bookId)
+/** Set (or toggle when `desired` is omitted) a saved-shelf entry. */
+export async function setSavedBook(
+  userId: string,
+  bookId: string,
+  desired?: boolean,
+): Promise<BookEngagementState> {
   const uid = new Types.ObjectId(userId)
   const bid = new Types.ObjectId(bookId)
+  const likedPromise = BookLike.exists({ userId: uid, bookId: bid })
 
-  const existing = await SavedBook.findOne({ userId: uid, bookId: bid })
-  if (existing) {
-    await existing.deleteOne()
+  const target = desired ?? !(await SavedBook.exists({ userId: uid, bookId: bid }))
+
+  if (target) {
+    const [bookExists] = await Promise.all([
+      Book.exists({ _id: bid }),
+      SavedBook.updateOne(
+        { userId: uid, bookId: bid },
+        { $setOnInsert: { savedAt: new Date() } },
+        { upsert: true },
+      ),
+    ])
+    if (!bookExists) {
+      await SavedBook.deleteOne({ userId: uid, bookId: bid })
+      throw new Error('BOOK_NOT_FOUND')
+    }
   } else {
-    await SavedBook.create({ userId: uid, bookId: bid })
+    await SavedBook.deleteOne({ userId: uid, bookId: bid })
   }
 
-  return getBookEngagement(userId, bookId)
+  return { liked: Boolean(await likedPromise), saved: target }
 }
 
 async function buildShelfItems(
